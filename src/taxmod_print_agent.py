@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "taxmod-print-agent 0.4.0"
+VERSION = "taxmod-print-agent 0.5.0"
 TOKEN_HEADER = "X-Taxmod-Print-Token"
 
 # Per label format: the CUPS options. The browser test showed the Brother driver wants landscape for labels as wide
@@ -139,10 +140,19 @@ class Agent:
     def printers(self) -> list[str]:
         return [f"{roll} mm: {queue}" for roll, queue in sorted(self.config["printers"].items())]
 
+    def queues(self) -> list[str]:
+        """D-1336: the CUPS queues of this computer; WordPress hands over only the jobs for these. Without them no pull,
+        so a second computer never takes jobs it cannot print."""
+        done = self.run(["lpstat", "-e"], capture_output=True, text=True, timeout=30)
+        names = [line.strip() for line in (done.stdout or "").splitlines() if PLAIN.match(line.strip())]
+        if done.returncode != 0 or not names:
+            raise OSError(f"lpstat -e lists no CUPS queue: {(done.stderr or '').strip() or done.returncode}")
+        return names
+
     def fetch_and_print(self) -> int:
         """One pull, then every job printed and answered. Returns how many jobs came."""
         with self.lock:
-            answer = self.wordpress.call("print/pull", {"agent": VERSION, "printers": self.printers()})
+            answer = self.wordpress.call("print/pull", {"agent": VERSION, "host": socket.gethostname(), "printers": self.printers(), "queues": self.queues()})
             jobs = answer.get("jobs", [])
             for job in jobs:
                 ok, message = self.print_job(job)

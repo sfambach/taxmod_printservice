@@ -21,6 +21,15 @@ def config(**extra):
         os.unlink(handle.name)
 
 
+def with_lpstat(run, queues="QL-810W_take\nPhomemo_M220L\n"):
+    """D-1336: every pull asks CUPS for the queues of this computer first."""
+    def answer(command, **kwargs):
+        if command[:2] == ["lpstat", "-e"]:
+            return subprocess.CompletedProcess(command, 0, stdout=queues, stderr="")
+        return run(command, **kwargs)
+    return answer
+
+
 class FakeWordPress:
     def __init__(self, jobs):
         self.jobs = jobs
@@ -75,7 +84,7 @@ class AgentTest(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout="        job-state (enum) = completed\n", stderr="")
             return run(command, **kwargs)
 
-        service = agent.Agent(config(), run=run_and_watch, spawn=lambda work: work())
+        service = agent.Agent(config(), run=with_lpstat(run_and_watch), spawn=lambda work: work())
         service.wordpress = FakeWordPress([
             {"id": 5, "roll": 62.0, "format": "roll62", "code": "O-1", "pdf": base64.b64encode(b"%PDF-1.4").decode()},
             {"id": 6, "roll": 62.0, "format": "holder62", "code": "O-2", "pdf": base64.b64encode(b"%PDF-1.4").decode()},
@@ -86,9 +95,19 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(paths, ["print/pull", "print/jobs/5/progress", "print/jobs/5/result", "print/jobs/6/progress", "print/jobs/6/result"])
         self.assertTrue(service.wordpress.calls[2][1]["ok"])
         self.assertIn("62 mm: QL-810W_take", service.wordpress.calls[0][1]["printers"])
+        self.assertEqual(service.wordpress.calls[0][1]["queues"], ["QL-810W_take", "Phomemo_M220L"])
+        self.assertTrue(service.wordpress.calls[0][1]["host"])
+
+    def test_without_cups_queues_there_is_no_pull(self):
+        # D-1336: a computer that cannot say its queues would be handed every job; it asks for none instead.
+        service = agent.Agent(config(), run=with_lpstat(lambda *a, **k: self.fail("nothing to print"), queues=""))
+        service.wordpress = FakeWordPress([{"id": 1}])
+        with self.assertRaises(OSError):
+            service.fetch_and_print()
+        self.assertEqual(service.wordpress.calls, [])
 
     def test_a_failing_lp_is_reported_as_failed(self):
-        service = agent.Agent(config(), run=lambda c, **k: subprocess.CompletedProcess(c, 1, stdout="", stderr="lp: The printer or class does not exist."))
+        service = agent.Agent(config(), run=with_lpstat(lambda c, **k: subprocess.CompletedProcess(c, 1, stdout="", stderr="lp: The printer or class does not exist.")))
         service.wordpress = FakeWordPress([{"id": 9, "roll": 62.0, "format": "roll62", "pdf": base64.b64encode(b"%PDF").decode()}])
         service.fetch_and_print()
         self.assertFalse(service.wordpress.calls[1][1]["ok"])
@@ -112,7 +131,7 @@ class AgentTest(unittest.TestCase):
 
     def watched(self, retry, *states):
         run, seen = self.ipp(*states)
-        service = agent.Agent(config(watch_seconds=60), run=run, spawn=lambda work: work(), sleep=lambda s: None)
+        service = agent.Agent(config(watch_seconds=60), run=with_lpstat(run), spawn=lambda work: work(), sleep=lambda s: None)
         job = {"id": 21, "roll": 40, "format": "x", "queue": "Phomemo_M220L", "options": {}, "pdf": base64.b64encode(b"%PDF").decode()}
         if retry:
             job["retry"] = True

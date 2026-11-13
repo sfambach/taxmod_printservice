@@ -45,3 +45,9 @@ tests, builds the `.deb` and attaches it to the GitHub release.
 `python3 -m unittest discover -s tests`
 
 Printers, label sizes and CUPS options live in the Taxmod model (Logistik › Drucker), not here.
+
+## Several computers
+
+Every computer with printers runs its own service with its own access (Taxmod › Configuration › Printing › Add print
+service). On each pull the service names the CUPS queues of its computer (`lpstat -e`), and WordPress hands it only the
+jobs for those queues, plus the jobs that name no queue (D-1336). A computer whose CUPS lists no queue does not pull.
