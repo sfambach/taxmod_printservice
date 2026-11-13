@@ -1,0 +1,13 @@
+Package: taxmod-printservice
+Version: @VERSION@
+Architecture: all
+Maintainer: sfambach <noreply@github.com>
+Depends: python3 (>= 3.8), cups-client, cups-ipp-utils
+Recommends: cups, policykit-1 | pkexec
+Section: utils
+Priority: optional
+Homepage: https://github.com/sfambach/taxmod_printservice
+Description: Taxmod print service
+ Fetches label print jobs from a Taxmod WordPress site and prints them
+ through CUPS. Runs as a systemd user service; set it up once per user
+ with «taxmod-printservice setup».

@@ -1,0 +1,157 @@
+"""Run: python3 -m unittest discover -s tests"""
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import taxmod_print_agent as agent  # noqa: E402
+
+
+def config(**extra):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump({"rest": "https://example.test/wp-json/taxmod/v1", "token": "t", "printers": {"62": "QL-810W_take"}, **extra}, handle)
+    try:
+        return agent.load_config(handle.name)
+    finally:
+        os.unlink(handle.name)
+
+
+class FakeWordPress:
+    def __init__(self, jobs):
+        self.jobs = jobs
+        self.calls = []
+
+    def call(self, path, body):
+        self.calls.append((path, body))
+        return {"jobs": self.jobs} if path == "print/pull" else {}
+
+
+class AgentTest(unittest.TestCase):
+    def test_a_format_brings_its_cups_options(self):
+        command = agent.lp_command(config(), {"id": 7, "roll": 62.0, "format": "holder62", "code": "O-1"}, "/tmp/x.pdf")
+        self.assertEqual(command[:3], ["lp", "-d", "QL-810W_take"])
+        self.assertIn("PageSize=62x50", command)
+        self.assertIn("orientation-requested=4", command)
+        self.assertEqual(command[-1], "/tmp/x.pdf")
+
+    def test_the_config_overrides_a_format(self):
+        command = agent.lp_command(config(formats={"holder62": {"PageSize": "62x52"}}), {"id": 1, "roll": 62, "format": "holder62"}, "f.pdf")
+        self.assertIn("PageSize=62x52", command)
+        self.assertNotIn("orientation-requested=4", command)
+
+    def test_a_job_with_its_printer_brings_queue_and_options(self):
+        job = {"id": 3, "roll": 40, "format": "phomemo40x30", "queue": "Phomemo_M220L", "options": {"PageSize": "w40h30"}}
+        command = agent.lp_command(config(formats={"phomemo40x30": {"PageSize": "w50h30"}}), job, "f.pdf")
+        self.assertEqual(command[:3], ["lp", "-d", "Phomemo_M220L"])
+        self.assertIn("PageSize=w40h30", command)
+        self.assertNotIn("PageSize=w50h30", command)
+
+    def test_a_queue_or_option_that_is_not_a_plain_name_fails_the_job(self):
+        for job in ({"queue": "-h evil"}, {"queue": "Q", "options": {"PageSize": "a b"}}, {"queue": "Q", "options": {"--x": "1"}}):
+            service = agent.Agent(config(), run=lambda *a, **k: self.fail("lp must not run"))
+            ok, _ = service.print_job({"id": 4, "roll": 40, "format": "x", "pdf": base64.b64encode(b"%PDF-").decode(), **job})
+            self.assertFalse(ok)
+
+    def test_a_roll_without_printer_fails_the_job_not_the_service(self):
+        service = agent.Agent(config(), run=lambda *a, **k: self.fail("lp must not run"))
+        ok, message = service.print_job({"id": 2, "roll": 102.0, "format": "roll102", "pdf": base64.b64encode(b"%PDF-").decode()})
+        self.assertFalse(ok)
+        self.assertIn("102 mm", message)
+
+    def test_every_job_is_printed_and_answered(self):
+        printed = []
+
+        def run(command, **kwargs):
+            printed.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="request id is QL-810W_take-12 (1 file(s))", stderr="")
+
+        def run_and_watch(command, **kwargs):
+            if command[0] == "ipptool":
+                return subprocess.CompletedProcess(command, 0, stdout="        job-state (enum) = completed\n", stderr="")
+            return run(command, **kwargs)
+
+        service = agent.Agent(config(), run=run_and_watch, spawn=lambda work: work())
+        service.wordpress = FakeWordPress([
+            {"id": 5, "roll": 62.0, "format": "roll62", "code": "O-1", "pdf": base64.b64encode(b"%PDF-1.4").decode()},
+            {"id": 6, "roll": 62.0, "format": "holder62", "code": "O-2", "pdf": base64.b64encode(b"%PDF-1.4").decode()},
+        ])
+        self.assertEqual(service.fetch_and_print(), 2)
+        self.assertEqual(len(printed), 2)
+        paths = [path for path, _ in service.wordpress.calls]
+        self.assertEqual(paths, ["print/pull", "print/jobs/5/progress", "print/jobs/5/result", "print/jobs/6/progress", "print/jobs/6/result"])
+        self.assertTrue(service.wordpress.calls[2][1]["ok"])
+        self.assertIn("62 mm: QL-810W_take", service.wordpress.calls[0][1]["printers"])
+
+    def test_a_failing_lp_is_reported_as_failed(self):
+        service = agent.Agent(config(), run=lambda c, **k: subprocess.CompletedProcess(c, 1, stdout="", stderr="lp: The printer or class does not exist."))
+        service.wordpress = FakeWordPress([{"id": 9, "roll": 62.0, "format": "roll62", "pdf": base64.b64encode(b"%PDF").decode()}])
+        service.fetch_and_print()
+        self.assertFalse(service.wordpress.calls[1][1]["ok"])
+        self.assertIn("does not exist", service.wordpress.calls[1][1]["message"])
+
+    def ipp(self, *states):
+        """A run that answers lp once, then ipptool with each state in turn, and records cancel."""
+        seen = {"cancel": [], "states": list(states)}
+
+        def run(command, **kwargs):
+            if command[0] == "lp":
+                return subprocess.CompletedProcess(command, 0, stdout="request id is Phomemo_M220L-215 (1 file(s))", stderr="")
+            if command[0] == "cancel":
+                seen["cancel"].append(command[1])
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            state, message = seen["states"].pop(0) if seen["states"] else ("processing", "")
+            text = f"        job-state (enum) = {state}\n        job-printer-state-message (textWithoutLanguage) = {message}\n"
+            return subprocess.CompletedProcess(command, 0, stdout=text, stderr="")
+
+        return run, seen
+
+    def watched(self, retry, *states):
+        run, seen = self.ipp(*states)
+        service = agent.Agent(config(watch_seconds=60), run=run, spawn=lambda work: work(), sleep=lambda s: None)
+        job = {"id": 21, "roll": 40, "format": "x", "queue": "Phomemo_M220L", "options": {}, "pdf": base64.b64encode(b"%PDF").decode()}
+        if retry:
+            job["retry"] = True
+        service.wordpress = FakeWordPress([job])
+        service.fetch_and_print()
+        return service.wordpress.calls, seen
+
+    def test_cups_ids_and_states_are_read(self):
+        self.assertEqual(agent.cups_job("request id is QL-810W_take-12 (1 file(s))"), ("QL-810W_take", 12))
+        self.assertEqual(agent.job_state("  job-state (enum) = aborted\n  job-printer-state-message (textWithoutLanguage) = Unable to open serial port"), ("aborted", "Unable to open serial port"))
+
+    def test_with_retrying_off_the_first_failure_fails_the_job_and_cancels_it_in_cups(self):
+        # D-1234, his word 2026-11-08: «standardmäßig ist erstmal aus. Damit wir sehen, wenn was schief»
+        calls, seen = self.watched(False, ("processing", ""), ("pending-held", "Can't open Bluetooth connection: Host is down"))
+        self.assertEqual(seen["cancel"], ["Phomemo_M220L-215"])
+        self.assertEqual(calls[-1][0], "print/jobs/21/result")
+        self.assertFalse(calls[-1][1]["ok"])
+        self.assertIn("Host is down", calls[-1][1]["message"])
+
+    def test_with_retrying_on_cups_tries_again_and_the_wait_is_reported(self):
+        calls, seen = self.watched(True, ("pending-held", "Host is down"), ("processing", ""), ("completed", ""))
+        self.assertEqual(seen["cancel"], [])
+        self.assertIn(("print/jobs/21/progress", {"message": "Host is down (Phomemo_M220L-215)"}), calls)
+        self.assertTrue(calls[-1][1]["ok"])
+
+    def test_a_job_cups_gave_up_is_failed_with_its_reason(self):
+        calls, _ = self.watched(True, ("aborted", "Unable to open serial port: No such file or directory"))
+        self.assertFalse(calls[-1][1]["ok"])
+        self.assertIn("serial port", calls[-1][1]["message"])
+
+    def test_a_config_without_token_is_refused(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump({"rest": "x", "printers": {"62": "q"}}, handle)
+        try:
+            with self.assertRaises(ValueError):
+                agent.load_config(handle.name)
+        finally:
+            os.unlink(handle.name)
+
+
+if __name__ == "__main__":
+    unittest.main()

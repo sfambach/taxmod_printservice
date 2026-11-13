@@ -1,0 +1,26 @@
+name: Release
+
+# Push a tag vX.Y.Z (same as VERSION in src/taxmod_print_agent.py): tests run, the .deb is built and attached to the
+# release; «taxmod-printservice update» installs it from there.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Build .deb
+        run: scripts/build-deb.sh "${GITHUB_REF_NAME}"
+      - name: Check package
+        run: dpkg-deb --info dist/*.deb && dpkg-deb --contents dist/*.deb
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.deb --title "${GITHUB_REF_NAME}" --generate-notes
