@@ -37,7 +37,7 @@ The package restarts the running service after an update.
 
 ## Release
 
-Raise `VERSION` in `src/taxmod_print_agent.py`, commit, push a tag `v<that version>`. The `Release` workflow runs the
+Raise `VERSION` in `src/taxmod_print_agent.py`, commit, then run **Actions › Release › Run workflow** with `v<that version>` (or push that tag). The `Release` workflow runs the
 tests, builds the `.deb` and attaches it to the GitHub release.
 
 ## Tests
