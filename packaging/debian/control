@@ -2,7 +2,7 @@ Package: taxmod-printservice
 Version: @VERSION@
 Architecture: all
 Maintainer: sfambach <noreply@github.com>
-Depends: python3 (>= 3.8), cups-client, cups-ipp-utils
+Depends: python3 (>= 3.8), cups-client, cups-ipp-utils, openssl
 Recommends: cups, policykit-1 | pkexec
 Section: utils
 Priority: optional

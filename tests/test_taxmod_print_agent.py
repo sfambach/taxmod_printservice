@@ -11,6 +11,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import taxmod_print_agent as agent  # noqa: E402
 
+# The settings page's status file goes to a scratch folder, never into the home of whoever runs the tests.
+agent.STATUS_FILE = os.path.join(tempfile.mkdtemp(), "status.json")
+
 
 def config(**extra):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -151,16 +154,51 @@ class AgentTest(unittest.TestCase):
         self.assertFalse(calls[-1][1]["ok"])
         self.assertIn("Host is down", calls[-1][1]["message"])
 
-    def test_with_retrying_on_cups_tries_again_and_the_wait_is_reported(self):
+    def test_with_retrying_on_the_job_is_sent_again_and_the_new_try_is_reported(self):
+        # D-1332 (was: CUPS keeps trying on its own): the job leaves CUPS and is sent again, «retries» times at most.
         calls, seen = self.watched(True, ("pending-held", "Host is down"), ("processing", ""), ("completed", ""))
-        self.assertEqual(seen["cancel"], [])
-        self.assertIn(("print/jobs/21/progress", {"message": "Host is down (Phomemo_M220L-215)"}), calls)
+        self.assertEqual(seen["cancel"], ["Phomemo_M220L-215"])
+        self.assertIn(("print/jobs/21/progress", {"message": "Host is down (Phomemo_M220L-215) · new try 1/3 in 15 s"}), calls)
         self.assertTrue(calls[-1][1]["ok"])
+        self.assertIn("after 1 new tries", calls[-1][1]["message"])
 
-    def test_a_job_cups_gave_up_is_failed_with_its_reason(self):
-        calls, _ = self.watched(True, ("aborted", "Unable to open serial port: No such file or directory"))
+    def test_after_the_last_new_try_the_job_fails_with_its_reason(self):
+        calls, seen = self.watched(True, *[("aborted", "Unable to open serial port: No such file or directory")] * 4)
         self.assertFalse(calls[-1][1]["ok"])
         self.assertIn("serial port", calls[-1][1]["message"])
+        self.assertEqual(len([c for c in calls if "new try" in str(c[1].get("message", ""))]), 3)
+
+    def test_a_printer_with_a_pause_waits_after_each_job(self):
+        # D-1333: the Phomemo swallows labels sent too fast; its jobs go one by one, the pause after each.
+        run, _ = self.ipp(("completed", ""), ("completed", ""))
+        slept = []
+        service = agent.Agent(config(), run=with_lpstat(run), spawn=lambda work: self.fail("not in the background"), sleep=slept.append)
+        job = {"roll": 40, "format": "x", "queue": "Phomemo_M220L", "options": {}, "pause": 20, "pdf": base64.b64encode(b"%PDF").decode()}
+        service.wordpress = FakeWordPress([dict(job, id=31), dict(job, id=32)])
+        service.fetch_and_print()
+        self.assertEqual(slept, [20, 20])
+
+    def test_the_token_is_kept_sealed_and_read_back(self):
+        folder = tempfile.mkdtemp()
+        agent.save_token(folder, "geheim-123")
+        with open(os.path.join(folder, agent.TOKEN_FILE), "rb") as handle:
+            self.assertNotIn(b"geheim", handle.read())
+        self.assertEqual(oct(os.stat(os.path.join(folder, agent.TOKEN_FILE)).st_mode & 0o777), "0o600")
+        self.assertEqual(agent.read_token(folder), "geheim-123")
+        with open(os.path.join(folder, "config.json"), "w") as handle:
+            json.dump({"rest": "https://example.test/wp-json/taxmod/v1"}, handle)
+        self.assertEqual(agent.load_config(os.path.join(folder, "config.json"))["token"], "geheim-123")
+
+    def test_the_status_for_the_settings_page_follows_the_jobs(self):
+        run, _ = self.ipp(("completed", ""))
+        service = agent.Agent(config(), run=with_lpstat(run), spawn=lambda work: work(), sleep=lambda s: None)
+        service.wordpress = FakeWordPress([{"id": 41, "code": "P-1", "roll": 40, "format": "x", "queue": "Phomemo_M220L", "options": {}, "pdf": base64.b64encode(b"%PDF").decode()}])
+        service.fetch_and_print()
+        with open(agent.STATUS_FILE, encoding="utf-8") as handle:
+            status = json.load(handle)
+        self.assertEqual(status["jobs"][0]["state"], "printed")
+        self.assertIn("Phomemo_M220L", status["queues"])
+        self.assertTrue(status["last_pull"])
 
     def test_a_config_without_token_is_refused(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:

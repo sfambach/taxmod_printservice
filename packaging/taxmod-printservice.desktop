@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Taxmod Druckdienst
+Comment=Einstellungen und Zustand des Taxmod-Druckdiensts
+Exec=taxmod-printservice ui
+Icon=printer
+Terminal=false
+Categories=Settings;Printing;

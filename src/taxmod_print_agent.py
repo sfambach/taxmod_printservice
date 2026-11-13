@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import datetime
+import hashlib
 import json
 import logging
 import os
@@ -25,7 +28,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "taxmod-print-agent 0.5.0"
+VERSION = "taxmod-print-agent 0.6.0"
 TOKEN_HEADER = "X-Taxmod-Print-Token"
 
 # Per label format: the CUPS options. The browser test showed the Brother driver wants landscape for labels as wide
@@ -40,9 +43,51 @@ DEFAULT_FORMATS = {
 log = logging.getLogger("taxmod-print-agent")
 
 
+TOKEN_FILE = "token.enc"
+STATUS_FILE = "~/.local/state/taxmod-printservice/status.json"
+
+
+def secret_key() -> str:
+    """The key of the token file: this machine and this user. A copy of the file elsewhere opens nothing (D-1332)."""
+    try:
+        with open("/etc/machine-id", encoding="ascii") as handle:
+            machine = handle.read().strip()
+    except OSError:
+        machine = socket.gethostname()
+    return hashlib.sha256(f"taxmod-printservice:{machine}:{os.getuid()}".encode()).hexdigest()
+
+
+def openssl(arguments: list[str], data: bytes) -> bytes:
+    done = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt", "-pass", "env:TAXMOD_KEY", *arguments],
+                          input=data, capture_output=True, env={**os.environ, "TAXMOD_KEY": secret_key()}, timeout=30)
+    if done.returncode != 0:
+        raise ValueError("the token file cannot be read: " + done.stderr.decode("utf-8", "replace").strip())
+    return done.stdout
+
+
+def save_token(folder: str, token: str) -> None:
+    """D-1332: the token is never kept in clear; config.json holds everything else."""
+    path = os.path.join(os.path.expanduser(folder), TOKEN_FILE)
+    sealed = openssl(["-e", "-a", "-A"], token.encode("utf-8"))
+    descriptor = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(sealed)
+    os.replace(path + ".new", path)
+
+
+def read_token(folder: str) -> str:
+    path = os.path.join(os.path.expanduser(folder), TOKEN_FILE)
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as handle:
+        return openssl(["-d", "-a", "-A"], handle.read()).decode("utf-8").strip()
+
+
 def load_config(path: str) -> dict:
     with open(os.path.expanduser(path), encoding="utf-8") as handle:
         config = json.load(handle)
+    if not config.get("token"):
+        config["token"] = read_token(os.path.dirname(os.path.expanduser(path)))
     for key in ("rest", "token"):
         if not config.get(key):
             raise ValueError(f"config.json needs «{key}»")
@@ -54,6 +99,9 @@ def load_config(path: str) -> dict:
     # D-1234: how long a job is watched in CUPS after lp took it, and how often it is looked at.
     config.setdefault("watch_seconds", 900)
     config.setdefault("watch_every", 5)
+    # D-1332: a printer with «Automatisch wiederholen» on gets this many new tries, this far apart (Bluetooth: «Host is down»).
+    config.setdefault("retries", 3)
+    config.setdefault("retry_seconds", 15)
     formats = dict(DEFAULT_FORMATS)
     for key, options in (config.get("formats") or {}).items():
         formats[key] = options
@@ -111,6 +159,10 @@ def job_state(output: str) -> tuple[str, str]:
     return values.get("job-state", ""), values.get("job-printer-state-message", "")
 
 
+def now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 class WordPress:
     def __init__(self, config: dict):
         self.base = config["rest"].rstrip("/") + "/"
@@ -136,6 +188,29 @@ class Agent:
         self.spawn = spawn or (lambda work: threading.Thread(target=work, daemon=True).start())
         self.wake = threading.Event()
         self.lock = threading.Lock()
+        self.status_path = os.path.expanduser(STATUS_FILE)
+        self.status = {"version": VERSION, "host": socket.gethostname(), "last_pull": "", "last_error": "", "queues": [], "jobs": []}
+        self.recent = collections.deque(maxlen=30)
+
+    def note(self, **changes) -> None:
+        """What the settings page shows: the state of the service, written next to it after every change."""
+        self.status.update(changes, jobs=list(self.recent), written=now())
+        try:
+            os.makedirs(os.path.dirname(self.status_path), exist_ok=True)
+            with open(self.status_path + ".new", "w", encoding="utf-8") as handle:
+                json.dump(self.status, handle, ensure_ascii=False)
+            os.replace(self.status_path + ".new", self.status_path)
+        except OSError as error:
+            log.warning("status: %s", error)
+
+    def track(self, job: dict, state: str, message: str) -> None:
+        for entry in self.recent:
+            if entry["id"] == job.get("id"):
+                entry.update(state=state, message=message, time=now())
+                break
+        else:
+            self.recent.appendleft({"id": job.get("id"), "code": job.get("code", ""), "queue": job.get("queue", ""), "state": state, "message": message, "time": now()})
+        self.note()
 
     def printers(self) -> list[str]:
         return [f"{roll} mm: {queue}" for roll, queue in sorted(self.config["printers"].items())]
@@ -152,18 +227,35 @@ class Agent:
     def fetch_and_print(self) -> int:
         """One pull, then every job printed and answered. Returns how many jobs came."""
         with self.lock:
-            answer = self.wordpress.call("print/pull", {"agent": VERSION, "host": socket.gethostname(), "printers": self.printers(), "queues": self.queues()})
+            try:
+                queues = self.queues()
+                answer = self.wordpress.call("print/pull", {"agent": VERSION, "host": socket.gethostname(), "printers": self.printers(), "queues": queues})
+            except (urllib.error.URLError, OSError, ValueError) as error:
+                self.note(last_error=f"{now()} {error}")
+                raise
+            self.note(last_pull=now(), last_error="", queues=queues)
             jobs = answer.get("jobs", [])
             for job in jobs:
+                self.track(job, "printing", "")
                 ok, message = self.print_job(job)
                 taken = cups_job(message) if ok else None
                 if taken is None:
-                    self.answer(job["id"], "result", {"ok": ok, "message": message})
+                    self.result(job, ok, message)
                     continue
                 # D-1234: lp only took it; the job is printed when CUPS says so, not before.
                 self.answer(job["id"], "progress", {"message": f"CUPS {taken[0]}-{taken[1]}"})
-                self.spawn(lambda job=job, taken=taken: self.watch(job, taken[0], taken[1]))
+                # D-1333: a printer that needs a pause gets its jobs one after the other, the pause after each.
+                pause = max(0, int(job.get("pause") or 0))
+                if pause:
+                    self.watch(job, taken[0], taken[1])
+                    self.sleep(pause)
+                else:
+                    self.spawn(lambda job=job, taken=taken: self.watch(job, taken[0], taken[1]))
             return len(jobs)
+
+    def result(self, job: dict, ok: bool, message: str) -> None:
+        self.track(job, "printed" if ok else "failed", message)
+        self.answer(job["id"], "result", {"ok": ok, "message": message})
 
     def answer(self, job_id: int, step: str, body: dict) -> None:
         try:
@@ -179,27 +271,42 @@ class Agent:
         return job_state(done.stdout)
 
     def watch(self, job: dict, queue: str, number: int) -> None:
-        """D-1234: follows one CUPS job to its end. Retrying off (the default): the first failure ends it as failed."""
-        name, said, retry = f"{queue}-{number}", "", bool(job.get("retry"))
+        """D-1234: follows one CUPS job to its end. Retrying off (the default): the first failure ends it as failed. On
+        (D-1332): the job is taken out of CUPS and sent again, up to «retries» times, «retry_seconds» apart."""
+        name, said, retry, tries = f"{queue}-{number}", "", bool(job.get("retry")), 0
         deadline = time.monotonic() + int(self.config["watch_seconds"])
         while time.monotonic() < deadline:
             state, message = self.state_of(number)
             if state == "completed":
-                self.answer(job["id"], "result", {"ok": True, "message": f"Sent to the printer ({name})"})
+                self.result(job, True, f"Sent to the printer ({name})" + (f" after {tries} new tries" if tries else ""))
                 return
+            failed = state == "pending-held" or (state == "pending" and message != "") or state in ("aborted", "canceled")
+            if failed and retry and tries < int(self.config["retries"]):
+                tries += 1
+                if state not in ("aborted", "canceled"):
+                    self.run(["cancel", name], capture_output=True, text=True, timeout=30)
+                self.answer(job["id"], "progress", {"message": f"{message or state} ({name}) · new try {tries}/{self.config['retries']} in {self.config['retry_seconds']} s"})
+                self.sleep(int(self.config["retry_seconds"]))
+                ok, output = self.print_job(job)
+                taken = cups_job(output) if ok else None
+                if taken is None:
+                    self.result(job, False, output)
+                    return
+                queue, number = taken
+                name, said = f"{queue}-{number}", ""
+                continue
             if state in ("aborted", "canceled"):
-                self.answer(job["id"], "result", {"ok": False, "message": f"{message or state} ({name})"})
+                self.result(job, False, f"{message or state} ({name})")
                 return
-            failed = state == "pending-held" or (state == "pending" and message != "")
-            if failed and not retry:
+            if failed:
                 self.run(["cancel", name], capture_output=True, text=True, timeout=30)
-                self.answer(job["id"], "result", {"ok": False, "message": f"{message or 'CUPS held the job'} ({name})"})
+                self.result(job, False, f"{message or 'CUPS held the job'} ({name})")
                 return
             if message and message != said:
                 said = message
                 self.answer(job["id"], "progress", {"message": f"{message} ({name})"})
             self.sleep(int(self.config["watch_every"]))
-        self.answer(job["id"], "result", {"ok": False, "message": f"No end after {self.config['watch_seconds']} s: {said or 'no word from CUPS'} ({name})"})
+        self.result(job, False, f"No end after {self.config['watch_seconds']} s: {said or 'no word from CUPS'} ({name})")
 
     def print_job(self, job: dict) -> tuple[bool, str]:
         try:

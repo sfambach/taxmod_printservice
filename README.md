@@ -15,16 +15,32 @@ flowchart LR
 
 ## Install (once per machine)
 
-1. Download `taxmod-printservice_<version>_all.deb` from the [newest release](https://github.com/sfambach/taxmod_printservice/releases/latest).
-2. Install it: double-click it, or `sudo apt install ./taxmod-printservice_<version>_all.deb`.
-3. As the user that prints (not root): `taxmod-printservice setup`.
-   - Without a config it writes `~/.config/taxmod-print-agent/config.json`; fill in `rest`, `token`, `ntfy` and
-     `wake_url` from **Taxmod › Configuration › Printing › Set up access**, then run `setup` again.
-   - An existing config from the hand-installed script is used as it is; the old `taxmod-print-agent` service is
-     turned off so only one service prints.
-   - It starts the service and keeps it running without a login (`loginctl enable-linger`).
+```sh
+wget https://github.com/sfambach/taxmod_printservice/releases/latest/download/taxmod-printservice_0.6.0_all.deb
+sudo apt install ./taxmod-printservice_0.6.0_all.deb
+```
 
-Log: `journalctl --user -u taxmod-printservice -f`. One pull by hand: `taxmod-printservice once`.
+1. In WordPress: **Taxmod › Configuration › Printing › Add print service** (or **Pairing code** at an existing one).
+   The code holds 15 minutes and works once.
+2. Open **Taxmod Druckdienst** from the menu, enter the website and the code, click **Koppeln**.
+   Without a desktop: `taxmod-printservice pair https://www.fambach.net CODE`.
+3. Once, as the user that prints: `taxmod-printservice setup` (starts the service, keeps it running without a login,
+   turns off a hand-installed `taxmod-print-agent`, and moves a token still in `config.json` into the sealed file).
+
+## Settings page
+
+`taxmod-printservice ui` (the menu entry) serves http://127.0.0.1:8631 for this computer only: state, CUPS printers with
+a test page, the latest jobs, this computer's settings (new tries, their distance, watch time), the log, and **Update**
+(asks for the Linux password). Over ssh: `taxmod-printservice ui --no-browser` and `ssh -L 8631:127.0.0.1:8631 server`.
+
+The token lives encrypted in `~/.config/taxmod-print-agent/token.enc` (openssl AES-256, key from this machine and user);
+`config.json` holds the rest.
+
+## New tries and pause
+
+A printer with **Automatisch wiederholen** on (Taxmod model) gets a failed job taken out of CUPS and sent again, up to
+«Neuversuche» times, «Abstand» seconds apart. A printer with a **pause** in the model gets its jobs one by one, the pause
+after each (the Phomemo swallows labels sent too fast).
 
 ## Update
 

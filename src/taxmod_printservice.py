@@ -6,6 +6,8 @@
     taxmod-printservice setup          for this user: config, service on, keeps running without a login
     taxmod-printservice update         install the newest release (asks for the password)
     taxmod-printservice update --check only say whether there is a newer one
+    taxmod-printservice ui             the settings page on http://127.0.0.1:8631 (from the menu)
+    taxmod-printservice pair SITE CODE couple with Taxmod by the one-time code (for a computer without a desktop)
     taxmod-printservice version
 """
 
@@ -106,9 +108,10 @@ def setup(run=subprocess.run) -> int:
         config.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(EXAMPLE, config)
         config.chmod(0o600)
-        print(f"Wrote {config}. Put rest, token, ntfy and wake_url from Taxmod › Configuration › Printing into it,")
-        print("then run «taxmod-printservice setup» again.")
+        print(f"Wrote {config}. Couple it with Taxmod: open «Taxmod Druckdienst» from the menu and enter the code from")
+        print("Taxmod › Configuration › Printing, or run «taxmod-printservice pair https://… CODE»; then run setup again.")
         return 1
+    seal_token(config)
     agent.load_config(str(config))  # fails here, before the service starts, when rest or token is missing
 
     old = pathlib.Path(os.path.expanduser("~/.config/systemd/user")) / OLD_UNIT
@@ -127,6 +130,20 @@ def setup(run=subprocess.run) -> int:
     return 0
 
 
+def seal_token(config: pathlib.Path) -> None:
+    """D-1332: a token still in config.json in clear moves into the sealed token file."""
+    with open(config, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not data.get("token"):
+        return
+    agent.save_token(str(config.parent), str(data.pop("token")))
+    descriptor = os.open(str(config) + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+    os.replace(str(config) + ".new", config)
+    print(f"The token now lives sealed in {config.parent / agent.TOKEN_FILE}, no longer in config.json.")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="taxmod-printservice", description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -137,6 +154,13 @@ def main(argv: list[str]) -> int:
     command = commands.add_parser("update")
     command.add_argument("--check", action="store_true")
     commands.add_parser("version")
+    command = commands.add_parser("ui")
+    command.add_argument("--config", default=CONFIG)
+    command.add_argument("--no-browser", action="store_true", help="only print the address (over ssh: ssh -L 8631:127.0.0.1:8631)")
+    command = commands.add_parser("pair")
+    command.add_argument("site", help="e.g. https://www.fambach.net")
+    command.add_argument("code")
+    command.add_argument("--config", default=CONFIG)
     arguments = parser.parse_args(argv)
 
     if arguments.command == "version":
@@ -146,6 +170,16 @@ def main(argv: list[str]) -> int:
         return update(arguments.check)
     if arguments.command == "setup":
         return setup()
+    if arguments.command in ("ui", "pair"):
+        import taxmod_printservice_ui as ui
+        if arguments.command == "ui":
+            return ui.serve(arguments.config, not arguments.no_browser)
+        try:
+            print(ui.Page(arguments.config).pair({"site": arguments.site, "code": arguments.code}))
+        except ValueError as error:
+            print(error)
+            return 1
+        return 0
     return agent.main(["--config", arguments.config] + (["--once"] if arguments.command == "once" else []))
 
 
